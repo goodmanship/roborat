@@ -1,0 +1,249 @@
+require 'csv'
+require 'pry'
+require 'optparse'
+require_relative 'q_learner'
+
+SCREEN_W, SCREEN_H = `stty size`.scan(/\d+/).map(&:to_i)
+RANDOM_RATE = 0.20 # how often do we move randomly
+DEFAULT_REWARD = -1
+GOAL_REWARD = 1
+QUICKSAND_REWARD = -100 # penalty for stepping on quicksand
+RUN_LIMIT = 10_000
+FRAMERATE = 0.05 # seconds delay if animate option is passed
+
+def clear_screen!(rows)
+  print "\e[0;0H"
+  print (" " * SCREEN_W + "\n") * rows
+  print "\e[0;0H"
+end
+
+# TODO: redo this for ASCII MAPS
+def printmap(data, animate: false)
+  h = data.length
+  w = data.first.length
+  clear_screen!(h + 2)
+  puts "--------------------"
+  (0...h).each do |row|
+    (0...w).each do |col|
+      print "  " if data[row][col] == 0 # Empty space
+      print "O " if data[row][col] == 1 # Obstacle
+      print "* " if data[row][col] == 2 # El roboto
+      print "X " if data[row][col] == 3 # Goal
+      print ". " if data[row][col] == 4 # Trail
+      print "~ " if data[row][col] == 5 # Quick sand
+      print "@ " if data[row][col] == 6 # Stepped in quicksand
+    end
+    print "\n"
+  end
+  puts "--------------------"
+  sleep 0.05 if animate
+end
+
+# Search the map for a symbol
+# First match is returned.
+def search_map(map, val)
+  h = map.length
+  w = map.first.length
+  catch :found do
+    (0...h).each do |row|
+      (0...w).each do |col|
+        throw :found, [row, col] if map[row][col] == val
+      end
+    end
+    nil
+  end
+end
+
+# Find where the robot is in the map.
+def getrobotpos(map)
+  pos = search_map(map, 2)
+  puts "warning: start location not defined" unless pos
+  pos || [-1,-1]
+end
+
+# Find where the goal is in the map.
+def getgoalpos(map)
+  pos = search_map(map,3)
+  puts "warning: goal location not defined" unless pos
+  pos || [-1,-1]
+end
+
+def coords_invalid?(map, r, c)
+  h = map.length
+  w = map.first.length
+  (r < 0) || (r >= h) || ( c < 0 ) || (c >= w)
+end
+
+def newpos(oldpos, a)
+  r, c = oldpos
+  case a
+  when 0 then r -= 1 #north
+  when 1 then c += 1 #east
+  when 2 then r += 1 #south
+  when 3 then c -= 1 #west
+  end
+  [r, c]
+end
+
+# Move the robot and report reward.
+def movebot(map, oldpos, a)
+  r, c = oldpos
+  reward = DEFAULT_REWARD # default reward is negative one
+
+  # decide if we're going to ignore the action and go rogue instead
+  a = rand(3) if rand <= RANDOM_RATE
+
+  # update the test location
+  r, c = newpos(oldpos, a)
+
+  # Decide if the action is invalid then revert
+  if coords_invalid?(map, r, c) || map[r][c] == 1 # off the map
+    r, c = oldpos
+    return [[r,c], reward]
+  end
+
+  # If the action is valid, record the effect
+  case map[r][c]
+  when 5, 6 # it is quicksand
+    reward = QUICKSAND_REWARD
+    map[r][c] = 6 # mark the event
+  else
+    reward = GOAL_REWARD if map[r][c] == 3 # for reaching the goal
+    old_r, old_c = oldpos
+    map[old_r][old_c] = 4 # mark where we've been for map printing
+    map[r][c] = 2 # Update robot position
+  end
+
+  [[r, c], reward] # return the new legal location and reward
+end
+
+# convert the location to a single integer
+def discretize(pos)
+  pos[0]*10 + pos[1]
+end
+
+# Each epoch represents one trip to the goal.
+def run_epoch(epoch, map, startpos, goalpos, learner, verbose, animate = false)
+  this_map = deep_clone(map)
+  total_reward = 0
+  robopos = startpos
+  state = discretize(robopos) #convert the location to a state
+  action = learner.querysetstate(state) #set the state and get first action
+
+  count = 0
+  while (robopos != goalpos) & (count < RUN_LIMIT)
+    newpos, stepreward = movebot(this_map,robopos,action) # move to new location according to action and then get a new action
+    state = discretize(newpos)
+    action = learner.query(state, stepreward)
+    robopos = newpos # update the location
+    total_reward += stepreward
+    count += 1
+  end
+
+  # Note that timeout happened if count hit 10k
+  puts "Epoch Timeout" if count == RUN_LIMIT
+
+  if verbose
+    printmap this_map, animate: animate
+    puts "#{epoch}, #{total_reward}"
+  end
+
+  total_reward
+end
+
+def test(map, epochs, learner, verbose, animate = false)
+  startpos = getrobotpos(map) #find where the robot starts
+  goalpos = getgoalpos(map) #find where the goal is
+  scores = []
+  (1..epochs).each {|e| scores << run_epoch(e, map, startpos, goalpos, learner, verbose, animate) }
+  median(scores)
+end
+
+def load_map(world)
+  # read in the map
+  filename = "worlds/#{world}"
+  File.read(filename)
+      .split("\n")
+      .map{|line| line.split("").map(&:to_i) }
+end
+
+# Test a learner.
+def run(world: '01', animate: false)
+  verbose = true # print lots of debug stuff if true
+  original_map = load_map(world)
+  printmap(original_map) if verbose
+
+  # Set the random seed.
+  srand 5
+
+  # Run Non-Dyna test.
+  learner = QLearner.new(
+    num_states: 100,
+    num_actions: 4,
+    alpha: 0.2,
+    gamma: 0.9,
+    rar: 0.98,
+    radr: 0.999,
+    dyna: 0,
+    verbose: false,
+  )
+
+  epochs = 500
+  map = deep_clone(original_map)
+  non_dyna_score = test(map, epochs, learner, verbose, animate)
+  puts "#{epochs} median total_reward #{non_dyna_score}\n"
+
+  # Run Dyna test.
+  learner = QLearner.new(
+    num_states: 100,
+    num_actions: 4,
+    alpha: 0.2,
+    gamma: 0.9,
+    rar: 0.5,
+    radr: 0.99,
+    dyna: 200,
+    verbose: false
+  )
+
+  epochs = 50
+  map = deep_clone(original_map)
+  dyna_score = test(map, epochs, learner, verbose, animate)
+  puts "#{epochs} median total_reward #{dyna_score}\n"
+
+  puts "\nResults for World #{world}"
+  puts "Non-Dyna Score: #{non_dyna_score}"
+  puts "Dyna Score    : #{dyna_score}"
+end
+
+def deep_clone(input)
+  if input.is_a? Array
+    input.map{|n| deep_clone(n) }
+  else
+    input.clone
+  end
+end
+
+def median(list)
+  s = list.sort
+  l = s.length
+  (s[(l-1)/2] + s[l/2]) / 2.0
+end
+
+if __FILE__ == $0
+  require 'optparse'
+
+  options = {world: '01', animate: false}
+  OptionParser.new do |opts|
+    opts.banner = "Usage: learner_test.rb [options]"
+
+    opts.on("-w", "--world [number]", "Specify a world to test on") do |w|
+      options[:world] = w
+    end
+
+    opts.on("-a", "--animate", "Render slowly so you can see the progress.") do |a|
+      options[:animate] = a
+    end
+  end.parse!
+
+  run(**options)
+end
