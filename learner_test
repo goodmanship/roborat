@@ -1,5 +1,5 @@
-require 'csv'
-require 'pry'
+#!/usr/bin/env ruby
+
 require 'optparse'
 require_relative 'q_learner'
 
@@ -245,5 +245,6 @@ if __FILE__ == $0
     end
   end.parse!
 
+  print "\033[2J" # fully clear the screen
   run(**options)
 end
